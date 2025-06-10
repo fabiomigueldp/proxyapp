@@ -159,18 +159,32 @@ PATTERN = re.compile(r"upload1", flags=re.I)
 
 class AuditorAddon:
     """mitmproxy addon to intercept and process HTTP flows"""
-    
+
     def __init__(
         self,
         gui_q: queue.Queue[Dict[str, Any]],
         mod_q: queue.Queue[Dict[str, Any]],
+        mode_q: queue.Queue[str],
     ) -> None:
         self.gui_q = gui_q
         self.mod_q = mod_q
+        self.mode_q = mode_q
+        self.mode = "interception"
         self.first_post_seen = False
+
+    def _update_mode(self) -> None:
+        """Fetches the latest mode from the queue if available"""
+        while True:
+            try:
+                new_mode = self.mode_q.get_nowait()
+                if new_mode in ("inspection", "interception"):
+                    self.mode = new_mode
+            except queue.Empty:
+                break
 
     def response(self, flow: http.HTTPFlow) -> None:
         """Processes intercepted HTTP responses"""
+        self._update_mode()
         if not PATTERN.search(flow.request.pretty_url):
             return
 
@@ -184,8 +198,12 @@ class AuditorAddon:
         flow_data = self._extract_flow_data(flow, is_initial_post)
         self.gui_q.put(flow_data)
 
+        if self.mode == "inspection":
+            return
+
         flow.reply.take()
         while True:
+            self._update_mode()
             try:
                 mod_data = self.mod_q.get(timeout=0.1)
                 if mod_data["id"] == flow.id:
@@ -195,8 +213,7 @@ class AuditorAddon:
                         flow.response.content = mod_data["resp_body_modified"]
                     break
             except queue.Empty:
-                if not self.gui_q.full():
-                    continue
+                continue
             except Exception:
                 break
         flow.reply()
@@ -208,7 +225,7 @@ class AuditorAddon:
             "id": flow.id,
             "is_initial_post": is_initial_post,
             "type": flow.type,
-            "mode": getattr(flow, 'mode', 'N/A'),
+            "mode": self.mode,
             
             "timestamp_created": getattr(flow, 'timestamp_created', time.time()),
             "timestamp_start": time.strftime("%H:%M:%S", time.localtime(flow.request.timestamp_start)),
@@ -318,6 +335,7 @@ class AuditorAddon:
 def run_proxy(
     gui_q: queue.Queue,
     mod_q: queue.Queue,
+    mode_q: queue.Queue,
     port: int,
     verbose: bool,
 ) -> None:
@@ -325,7 +343,7 @@ def run_proxy(
     async def main_coro():
         opts = Options(listen_host="127.0.0.1", listen_port=port, ssl_insecure=True)
         master = DumpMaster(opts, with_termlog=verbose, with_dumper=False)
-        master.addons.add(AuditorAddon(gui_q, mod_q))
+        master.addons.add(AuditorAddon(gui_q, mod_q, mode_q))
 
         try:
             await master.run()
@@ -355,6 +373,7 @@ class AdvancedProxyApp(tk.Tk):
 
         self.gui_q: queue.Queue[Dict[str, Any]] = queue.Queue()
         self.mod_q: queue.Queue[Dict[str, Any]] = queue.Queue()
+        self.mode_q: queue.Queue[str] = queue.Queue()
 
         self.setup_styles()
         
@@ -624,15 +643,17 @@ class AdvancedProxyApp(tk.Tk):
         btn_frame = ttk.Frame(self)
         btn_frame.pack(side="bottom", fill="x", pady=5)
         
-        ttk.Button(
-            btn_frame, text="▶️ Send Modified", 
+        self.send_mod_btn = ttk.Button(
+            btn_frame, text="▶️ Send Modified",
             command=self.send_modified
-        ).pack(side="left", padx=5)
-        
-        ttk.Button(
-            btn_frame, text="➡️ Send Original", 
+        )
+        self.send_mod_btn.pack(side="left", padx=5)
+
+        self.send_orig_btn = ttk.Button(
+            btn_frame, text="➡️ Send Original",
             command=self.send_unmodified
-        ).pack(side="left", padx=5)
+        )
+        self.send_orig_btn.pack(side="left", padx=5)
         
         ttk.Button(
             btn_frame, text="📋 Copy as cURL", 
@@ -645,20 +666,32 @@ class AdvancedProxyApp(tk.Tk):
         ).pack(side="left", padx=5)
         
         ttk.Button(
-            btn_frame, text="🗑️ Clear Session", 
+            btn_frame, text="🗑️ Clear Session",
             command=self.clear_session
         ).pack(side="right", padx=5)
-        
+
         ttk.Button(
-            btn_frame, text="⏸️ Pause Capture", 
+            btn_frame, text="⏸️ Pause Capture",
             command=self.toggle_capture
         ).pack(side="right", padx=5)
+
+        self.mode_var = tk.StringVar(value="interception")
+        ttk.Checkbutton(
+            btn_frame,
+            text="Inspection Mode",
+            variable=self.mode_var,
+            onvalue="inspection",
+            offvalue="interception",
+            command=self.toggle_mode,
+        ).pack(side="right", padx=5)
+        # initialize button states and inform proxy
+        self.toggle_mode()
 
     def start_proxy_thread(self):
         """Starts the proxy in a separate thread"""
         self.proxy_thread = threading.Thread(
             target=run_proxy,
-            args=(self.gui_q, self.mod_q, self.port, self.verbose),
+            args=(self.gui_q, self.mod_q, self.mode_q, self.port, self.verbose),
             daemon=True,
         )
         self.proxy_thread.start()
@@ -1058,6 +1091,19 @@ Protocol: WebSocket
     def toggle_capture(self):
         """Toggles flow capture"""
         messagebox.showinfo("Feature", "Pause/Resume capture will be implemented in a future version.")
+
+    def toggle_mode(self):
+        """Switches between inspection and interception modes"""
+        mode = self.mode_var.get()
+        if mode == "inspection":
+            self.send_mod_btn.config(state="disabled")
+            self.send_orig_btn.config(state="disabled")
+            self.status_var.set("Inspection mode active. Traffic flows uninterrupted.")
+        else:
+            self.send_mod_btn.config(state="normal")
+            self.send_orig_btn.config(state="normal")
+            self.status_var.set("Interception mode active. Matching flows will be held.")
+        self.mode_q.put(mode)
 
     def clear_session(self):
         """Clears all flows from the session"""
