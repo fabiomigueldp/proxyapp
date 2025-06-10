@@ -670,14 +670,6 @@ class AuditorAddon:
             "req_host": flow.request.host, # Added req_host
             "req_headers": dict(flow.request.headers),
             "req_body_bytes": flow.request.content or b'',
-    req_decoded_text, req_encoding_name, req_editable_flag = Codec.auto_decode(
-        flow_data["req_body_bytes"],
-        flow_data["req_headers"],
-        flow
-    )
-    flow_data["req_decoded_text"] = req_decoded_text
-    flow_data["req_encoding_name"] = req_encoding_name
-    flow_data["req_editable_flag"] = req_editable_flag
             "req_http_version": flow.request.http_version,
             "req_is_http10": flow.request.is_http10,
             "req_is_http11": flow.request.is_http11,
@@ -694,14 +686,6 @@ class AuditorAddon:
                 "resp_reason": flow.response.reason,
                 "resp_headers": dict(flow.response.headers),
                 "resp_body_bytes": flow.response.content or b'',
-    resp_decoded_text, resp_encoding_name, resp_editable_flag = Codec.auto_decode(
-        flow_data["resp_body_bytes"],
-        flow_data["resp_headers"],
-        flow
-    )
-    flow_data["resp_decoded_text"] = resp_decoded_text
-    flow_data["resp_encoding_name"] = resp_encoding_name
-    flow_data["resp_editable_flag"] = resp_editable_flag
                 "resp_http_version": flow.response.http_version,
                 "resp_is_http10": flow.response.is_http10,
                 "resp_is_http11": flow.response.is_http11,
@@ -720,9 +704,6 @@ class AuditorAddon:
                 "resp_reason": "N/A",
                 "resp_headers": {},
                 "resp_body_bytes": b'',
-    flow_data["resp_decoded_text"] = ""
-    flow_data["resp_encoding_name"] = "TEXT (Empty)"
-    flow_data["resp_editable_flag"] = True
                 "resp_http_version": "N/A",
                 "resp_is_http10": False,
                 "resp_is_http11": False,
@@ -734,6 +715,32 @@ class AuditorAddon:
                 "timestamp_end": "N/A",
                 "timestamp_end_raw": 0,
             })
+
+    # Request decoding (occurs *after* flow_data is initialized)
+    req_decoded_text, req_encoding_name, req_editable_flag = Codec.auto_decode(
+        flow_data["req_body_bytes"], # Use raw bytes from flow_data
+        flow_data["req_headers"],    # Use headers from flow_data
+        flow                       # Pass the live flow object
+    )
+    flow_data["req_decoded_text"] = req_decoded_text
+    flow_data["req_encoding_name"] = req_encoding_name
+    flow_data["req_editable_flag"] = req_editable_flag
+
+    # Response decoding (occurs *after* flow_data is initialized)
+    if flow.response:
+        resp_decoded_text, resp_encoding_name, resp_editable_flag = Codec.auto_decode(
+            flow_data["resp_body_bytes"], # Use raw bytes from flow_data
+            flow_data["resp_headers"],    # Use headers from flow_data
+            flow                          # Pass the live flow object
+        )
+        flow_data["resp_decoded_text"] = resp_decoded_text
+        flow_data["resp_encoding_name"] = resp_encoding_name
+        flow_data["resp_editable_flag"] = resp_editable_flag
+    else:
+        # Ensure these keys are present even if there's no response
+        flow_data["resp_decoded_text"] = ""
+        flow_data["resp_encoding_name"] = "TEXT (Empty)"
+        flow_data["resp_editable_flag"] = True
         
         if flow.error:
             flow_data["error_msg"] = str(flow.error.msg)
