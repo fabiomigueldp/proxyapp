@@ -164,27 +164,30 @@ class AuditorAddon:
         self,
         gui_q: queue.Queue[Dict[str, Any]],
         mod_q: queue.Queue[Dict[str, Any]],
-        mode_q: queue.Queue[str],
+        command_q: queue.Queue[Dict[str, Any]],
     ) -> None:
         self.gui_q = gui_q
         self.mod_q = mod_q
-        self.mode_q = mode_q
+        self.command_q = command_q
         self.mode = "interception"
         self.first_post_seen = False
 
-    def _update_mode(self) -> None:
-        """Fetches the latest mode from the queue if available"""
+    def _process_commands(self) -> None:
+        """Processes queued commands from the GUI"""
         while True:
             try:
-                new_mode = self.mode_q.get_nowait()
-                if new_mode in ("inspection", "interception"):
-                    self.mode = new_mode
+                cmd = self.command_q.get_nowait()
             except queue.Empty:
                 break
+            if cmd.get("type") == "SET_MODE":
+                mode = cmd.get("mode")
+                if mode in ("inspection", "interception"):
+                    self.mode = mode
 
     def response(self, flow: http.HTTPFlow) -> None:
         """Processes intercepted HTTP responses"""
-        self._update_mode()
+        self._process_commands()
+
         if not PATTERN.search(flow.request.pretty_url):
             return
 
@@ -217,6 +220,7 @@ class AuditorAddon:
             except Exception:
                 break
         flow.reply()
+        self._process_commands()
 
     def _extract_flow_data(self, flow: http.HTTPFlow, is_initial_post: bool) -> Dict[str, Any]:
         """Extracts all possible information from the HTTP flow"""
@@ -335,7 +339,7 @@ class AuditorAddon:
 def run_proxy(
     gui_q: queue.Queue,
     mod_q: queue.Queue,
-    mode_q: queue.Queue,
+    command_q: queue.Queue,
     port: int,
     verbose: bool,
 ) -> None:
@@ -343,7 +347,7 @@ def run_proxy(
     async def main_coro():
         opts = Options(listen_host="127.0.0.1", listen_port=port, ssl_insecure=True)
         master = DumpMaster(opts, with_termlog=verbose, with_dumper=False)
-        master.addons.add(AuditorAddon(gui_q, mod_q, mode_q))
+        master.addons.add(AuditorAddon(gui_q, mod_q, command_q))
 
         try:
             await master.run()
@@ -373,7 +377,7 @@ class AdvancedProxyApp(tk.Tk):
 
         self.gui_q: queue.Queue[Dict[str, Any]] = queue.Queue()
         self.mod_q: queue.Queue[Dict[str, Any]] = queue.Queue()
-        self.mode_q: queue.Queue[str] = queue.Queue()
+        self.command_q: queue.Queue[Dict[str, Any]] = queue.Queue()
 
         self.setup_styles()
         
@@ -691,7 +695,7 @@ class AdvancedProxyApp(tk.Tk):
         """Starts the proxy in a separate thread"""
         self.proxy_thread = threading.Thread(
             target=run_proxy,
-            args=(self.gui_q, self.mod_q, self.mode_q, self.port, self.verbose),
+            args=(self.gui_q, self.mod_q, self.command_q, self.port, self.verbose),
             daemon=True,
         )
         self.proxy_thread.start()
@@ -742,6 +746,7 @@ class AdvancedProxyApp(tk.Tk):
         """Handles the selection of a flow"""
         selected_items = self.tree.selection()
         if not selected_items:
+            self.update_action_button_states()
             return
             
         iid = selected_items[0]
@@ -759,8 +764,9 @@ class AdvancedProxyApp(tk.Tk):
         self.populate_codec_tab(flow_data, iid)
         self.populate_errors_tab(flow_data)
         self.populate_websocket_tab(flow_data)
-        
+
         self.status_var.set(f"Selected flow: {iid[:8]} - {flow_data['req_method']} {flow_data['req_url']}")
+        self.update_action_button_states()
 
     def clear_all_views(self):
         """Clears all views"""
@@ -1055,6 +1061,7 @@ Protocol: WebSocket
             del self.flows_data[iid]
         self.clear_all_views()
         self.status_var.set(f"Flow {iid[:8]} {message}.")
+        self.update_action_button_states()
 
     def copy_as_curl(self):
         """Copies the flow as a cURL command"""
@@ -1096,14 +1103,19 @@ Protocol: WebSocket
         """Switches between inspection and interception modes"""
         mode = self.mode_var.get()
         if mode == "inspection":
-            self.send_mod_btn.config(state="disabled")
-            self.send_orig_btn.config(state="disabled")
             self.status_var.set("Inspection mode active. Traffic flows uninterrupted.")
         else:
-            self.send_mod_btn.config(state="normal")
-            self.send_orig_btn.config(state="normal")
             self.status_var.set("Interception mode active. Matching flows will be held.")
-        self.mode_q.put(mode)
+        self.command_q.put({"type": "SET_MODE", "mode": mode})
+        self.update_action_button_states()
+
+    def update_action_button_states(self):
+        """Updates send button states based on mode and selection"""
+        in_interception = self.mode_var.get() == "interception"
+        has_selection = bool(self.tree.selection())
+        state = "normal" if in_interception and has_selection else "disabled"
+        self.send_mod_btn.config(state=state)
+        self.send_orig_btn.config(state=state)
 
     def clear_session(self):
         """Clears all flows from the session"""
@@ -1115,6 +1127,7 @@ Protocol: WebSocket
             self.flows_data.clear()
             self.clear_all_views()
             self.status_var.set("Session cleared.")
+            self.update_action_button_states()
 
 def main():
     """Main function"""
