@@ -354,9 +354,9 @@ class ContextualDecoder(Decoder):
         self.rules = [
             # Example Rule for api7.mql5.net
             {
-                "condition": lambda flow: flow.request.host == "api7.mql5.net",
+                "condition": lambda flow: flow.request.host == "upload1.myfxbook.com",
                 "action_type": "DECODE_AS_GZIP", # Custom action type
-                "encoding_name": "GZIP (Contextual: api7.mql5.net)"
+                "encoding_name": "GZIP (Contextual: upload1.myfxbook.com)"
             },
             # Add more rules here if needed for testing
         ]
@@ -670,6 +670,14 @@ class AuditorAddon:
             "req_host": flow.request.host, # Added req_host
             "req_headers": dict(flow.request.headers),
             "req_body_bytes": flow.request.content or b'',
+    req_decoded_text, req_encoding_name, req_editable_flag = Codec.auto_decode(
+        flow_data["req_body_bytes"],
+        flow_data["req_headers"],
+        flow
+    )
+    flow_data["req_decoded_text"] = req_decoded_text
+    flow_data["req_encoding_name"] = req_encoding_name
+    flow_data["req_editable_flag"] = req_editable_flag
             "req_http_version": flow.request.http_version,
             "req_is_http10": flow.request.is_http10,
             "req_is_http11": flow.request.is_http11,
@@ -686,6 +694,14 @@ class AuditorAddon:
                 "resp_reason": flow.response.reason,
                 "resp_headers": dict(flow.response.headers),
                 "resp_body_bytes": flow.response.content or b'',
+    resp_decoded_text, resp_encoding_name, resp_editable_flag = Codec.auto_decode(
+        flow_data["resp_body_bytes"],
+        flow_data["resp_headers"],
+        flow
+    )
+    flow_data["resp_decoded_text"] = resp_decoded_text
+    flow_data["resp_encoding_name"] = resp_encoding_name
+    flow_data["resp_editable_flag"] = resp_editable_flag
                 "resp_http_version": flow.response.http_version,
                 "resp_is_http10": flow.response.is_http10,
                 "resp_is_http11": flow.response.is_http11,
@@ -704,6 +720,9 @@ class AuditorAddon:
                 "resp_reason": "N/A",
                 "resp_headers": {},
                 "resp_body_bytes": b'',
+    flow_data["resp_decoded_text"] = ""
+    flow_data["resp_encoding_name"] = "TEXT (Empty)"
+    flow_data["resp_editable_flag"] = True
                 "resp_http_version": "N/A",
                 "resp_is_http10": False,
                 "resp_is_http11": False,
@@ -1257,26 +1276,17 @@ Response MD5 Hash: {FlowAnalyzer.calculate_hash(flow_data['resp_body_bytes'])}
         self.req_headers_text.insert("1.0", headers_text)
         self.req_headers_text.config(state="disabled")
         
-        # Construct a simplified flow-like object for contextual decoding
-        mock_request_obj = type('MockRequest', (object,), {
-            'host': flow_data.get('req_host', None), # Use .get for safety
-            'headers': flow_data.get('req_headers', {})
-        })
-        mock_flow_obj = type('MockFlow', (object,), {'request': mock_request_obj, 'response': None})
-
-        req_decoded, req_type, req_editable = Codec.auto_decode(
-            flow_data["req_body_bytes"],
-            flow_data["req_headers"],
-            mock_flow_obj  # Pass the mock flow object
-        )
+        req_decoded_text = flow_data["req_decoded_text"]
+        req_encoding_name = flow_data["req_encoding_name"]
+        req_editable_flag = flow_data["req_editable_flag"]
         
         content_type_header = flow_data["req_headers"].get("content-type", "")
-        formatted_content = Codec.format_content(req_decoded, content_type_header)
+        formatted_content = Codec.format_content(req_decoded_text, content_type_header)
         
         self.req_body_text.config(state="normal")
         self.req_body_text.delete("1.0", tk.END)
         self.req_body_text.insert("1.0", formatted_content)
-        if not req_editable:
+        if not req_editable_flag:
             self.req_body_text.config(state="disabled")
         
         # Update the req_info_text to show the new descriptive req_type
@@ -1287,7 +1297,7 @@ HTTP/2: {'Yes' if flow_data['req_is_http2'] else 'No'}
 HTTP/3: {'Yes' if flow_data['req_is_http3'] else 'No'}
 Stream: {flow_data['req_stream']}
 Trailers: {len(flow_data['req_trailers'])} items
-Detected Codec: {req_type}""" # New req_type used here
+Detected Codec: {req_encoding_name}"""
         
         self.req_info_text.config(state="normal")
         self.req_info_text.delete("1.0", tk.END)
@@ -1302,28 +1312,17 @@ Detected Codec: {req_type}""" # New req_type used here
         self.resp_headers_text.insert("1.0", headers_text)
         self.resp_headers_text.config(state="disabled")
         
-        mock_request_obj = type('MockRequest', (object,), {
-            'host': flow_data.get('req_host', None),
-            'headers': flow_data.get('req_headers', {})
-        })
-        mock_response_obj = type('MockResponse', (object,), {
-            'headers': flow_data.get('resp_headers', {})
-        })
-        mock_flow_obj = type('MockFlow', (object,), {'request': mock_request_obj, 'response': mock_response_obj})
-
-        resp_decoded, resp_type, resp_editable = Codec.auto_decode(
-            flow_data["resp_body_bytes"],
-            flow_data["resp_headers"],
-            mock_flow_obj # Pass the mock flow object
-        )
+        resp_decoded_text = flow_data["resp_decoded_text"]
+        resp_encoding_name = flow_data["resp_encoding_name"]
+        resp_editable_flag = flow_data["resp_editable_flag"]
         
         content_type_header = flow_data["resp_headers"].get("content-type", "")
-        formatted_content = Codec.format_content(resp_decoded, content_type_header)
+        formatted_content = Codec.format_content(resp_decoded_text, content_type_header)
         
         self.resp_body_text.config(state="normal")
         self.resp_body_text.delete("1.0", tk.END)
         self.resp_body_text.insert("1.0", formatted_content)
-        if not resp_editable:
+        if not resp_editable_flag:
             self.resp_body_text.config(state="disabled")
         
         http_info = f"""HTTP Version: {flow_data['resp_http_version']}
@@ -1333,7 +1332,7 @@ HTTP/2: {'Yes' if flow_data['resp_is_http2'] else 'No'}
 HTTP/3: {'Yes' if flow_data['resp_is_http3'] else 'No'}
 Stream: {flow_data['resp_stream']}
 Trailers: {len(flow_data['resp_trailers'])} items
-Detected Codec: {resp_type}""" # New resp_type used here
+Detected Codec: {resp_encoding_name}"""
         
         self.resp_info_text.config(state="normal")
         self.resp_info_text.delete("1.0", tk.END)
@@ -1391,43 +1390,32 @@ Transfer Rate: {(len(flow_data['req_body_bytes']) + len(flow_data['resp_body_byt
     def populate_codec_tab(self, flow_data: Dict[str, Any], iid: str):
         """Populates the codec/editing tab"""
         # Request part
-        mock_req_request_obj = type('MockRequest', (object,), {
-            'host': flow_data.get('req_host', None),
-            'headers': flow_data.get('req_headers', {})
-        })
-        mock_req_flow_obj = type('MockFlow', (object,), {'request': mock_req_request_obj, 'response': None})
-        req_decoded, req_type, req_editable = Codec.auto_decode(
-            flow_data["req_body_bytes"], flow_data["req_headers"], mock_req_flow_obj
-        )
+        req_decoded_text = flow_data["req_decoded_text"]
+        req_encoding_name = flow_data["req_encoding_name"]
+        req_editable_flag = flow_data["req_editable_flag"]
+
         self.req_edit_text.config(state="normal")
         self.req_edit_text.delete("1.0", tk.END)
-        self.req_edit_text.insert("1.0", req_decoded)
-        if not req_editable:
+        self.req_edit_text.insert("1.0", req_decoded_text)
+        if not req_editable_flag:
             self.req_edit_text.config(state="disabled")
-        self.req_codec_label.config(text=f"Detected Codec: {req_type}")
+        self.req_codec_label.config(text=f"Detected Codec: {req_encoding_name}")
 
         # Response part
-        mock_resp_request_obj = type('MockRequest', (object,), {
-            'host': flow_data.get('req_host', None),
-            'headers': flow_data.get('req_headers', {})
-        })
-        mock_resp_response_obj = type('MockResponse', (object,), {
-            'headers': flow_data.get('resp_headers', {})
-        })
-        mock_resp_flow_obj = type('MockFlow', (object,), {'request': mock_resp_request_obj, 'response': mock_resp_response_obj})
-        resp_decoded, resp_type, resp_editable = Codec.auto_decode(
-            flow_data["resp_body_bytes"], flow_data["resp_headers"], mock_resp_flow_obj
-        )
+        resp_decoded_text = flow_data["resp_decoded_text"]
+        resp_encoding_name = flow_data["resp_encoding_name"]
+        resp_editable_flag = flow_data["resp_editable_flag"]
+
         self.resp_edit_text.config(state="normal")
         self.resp_edit_text.delete("1.0", tk.END)
-        self.resp_edit_text.insert("1.0", resp_decoded)
-        if not resp_editable:
+        self.resp_edit_text.insert("1.0", resp_decoded_text)
+        if not resp_editable_flag:
             self.resp_edit_text.config(state="disabled")
-        self.resp_codec_label.config(text=f"Detected Codec: {resp_type}")
+        self.resp_codec_label.config(text=f"Detected Codec: {resp_encoding_name}")
         
         self.codec_info[iid] = {
-            'req_type': req_type,
-            'resp_type': resp_type
+            'req_type': req_encoding_name,
+            'resp_type': resp_encoding_name
         }
 
     def populate_errors_tab(self, flow_data: Dict[str, Any]):
