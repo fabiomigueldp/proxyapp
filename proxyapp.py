@@ -164,13 +164,29 @@ class AuditorAddon:
         self,
         gui_q: queue.Queue[Dict[str, Any]],
         mod_q: queue.Queue[Dict[str, Any]],
+        command_q: queue.Queue[Dict[str, Any]],
     ) -> None:
         self.gui_q = gui_q
         self.mod_q = mod_q
+        self.command_q = command_q
+        self.operational_mode = "Interception"
         self.first_post_seen = False
 
     def response(self, flow: http.HTTPFlow) -> None:
-        """Processes intercepted HTTP responses"""
+        # Check for commands from the GUI, like mode changes
+        try:
+            while not self.command_q.empty():
+                command = self.command_q.get_nowait()
+                if command.get("type") == "SET_MODE":
+                    new_mode = command.get("mode")
+                    if new_mode in ["Inspection", "Interception"]:
+                        self.operational_mode = new_mode
+                        ctx.log.info(f"[Auditor] Switched to {self.operational_mode} Mode.")
+                    else:
+                        ctx.log.warn(f"[Auditor] Unknown mode received: {new_mode}")
+        except queue.Empty:
+            pass # No commands pending
+
         if not PATTERN.search(flow.request.pretty_url):
             return
 
@@ -179,27 +195,47 @@ class AuditorAddon:
             self.first_post_seen = True
             is_initial_post = True
         
-        ctx.log.info(f"[Auditor] Intercepted: {flow.request.method} {flow.request.pretty_url}")
+        ctx.log.info(f"[Auditor] Intercepted ({self.operational_mode} Mode): {flow.request.method} {flow.request.pretty_url}")
 
         flow_data = self._extract_flow_data(flow, is_initial_post)
         self.gui_q.put(flow_data)
 
-        flow.reply.take()
-        while True:
-            try:
-                mod_data = self.mod_q.get(timeout=0.1)
-                if mod_data["id"] == flow.id:
-                    if mod_data.get("req_body_modified") is not None:
-                        flow.request.content = mod_data["req_body_modified"]
-                    if mod_data.get("resp_body_modified") is not None:
-                        flow.response.content = mod_data["resp_body_modified"]
-                    break
-            except queue.Empty:
-                if not self.gui_q.full():
+        if self.operational_mode == "Interception":
+            flow.reply.take()
+            # Add a small timeout to mod_q.get to allow command_q processing
+            # if we were to check command_q inside this loop too.
+            # For now, command_q is checked at the start of response.
+            while True:
+                try:
+                    # Check for commands again in case of long-held flow?
+                    # This could be complex. For now, mode set at start of response handles new flows.
+                    # Held flows will complete in the mode they were caught in.
+                    mod_data = self.mod_q.get(timeout=0.1) # Keep timeout to allow GUI responsiveness
+                    if mod_data["id"] == flow.id:
+                        if mod_data.get("req_body_modified") is not None:
+                            flow.request.content = mod_data["req_body_modified"]
+                        if mod_data.get("resp_body_modified") is not None:
+                            flow.response.content = mod_data["resp_body_modified"]
+                        break
+                except queue.Empty:
+                    # This is important: if we are in interception mode and waiting,
+                    # we should not continuously try to process command_q here,
+                    # as it would block the primary function of waiting for mod_data.
+                    # The mode is set when the flow first comes into response().
+                    # If a mode change happens while a flow is *already* held,
+                    # it will complete based on the mode it was captured in.
+                    # This matches the requirement: "Flows that were already
+                    # intercepted and are being held in 'Interception Mode' should
+                    # remain held even if the user switches to 'Inspection Mode'."
                     continue
-            except Exception:
-                break
-        flow.reply()
+                except Exception as e:
+                    ctx.log.error(f"[Auditor] Error processing mod_q: {e}")
+                    break # Break on other errors
+            flow.reply()
+        else: # Inspection Mode
+            # Flow automatically continues, no flow.reply.take() or flow.reply() here
+            # as mitmproxy handles it if we don't take the reply.
+            ctx.log.info(f"[Auditor] Inspecting (not holding): {flow.request.pretty_url}")
 
     def _extract_flow_data(self, flow: http.HTTPFlow, is_initial_post: bool) -> Dict[str, Any]:
         """Extracts all possible information from the HTTP flow"""
@@ -318,6 +354,7 @@ class AuditorAddon:
 def run_proxy(
     gui_q: queue.Queue,
     mod_q: queue.Queue,
+    command_q: queue.Queue,
     port: int,
     verbose: bool,
 ) -> None:
@@ -325,7 +362,7 @@ def run_proxy(
     async def main_coro():
         opts = Options(listen_host="127.0.0.1", listen_port=port, ssl_insecure=True)
         master = DumpMaster(opts, with_termlog=verbose, with_dumper=False)
-        master.addons.add(AuditorAddon(gui_q, mod_q))
+        master.addons.add(AuditorAddon(gui_q, mod_q, command_q))
 
         try:
             await master.run()
@@ -355,6 +392,8 @@ class AdvancedProxyApp(tk.Tk):
 
         self.gui_q: queue.Queue[Dict[str, Any]] = queue.Queue()
         self.mod_q: queue.Queue[Dict[str, Any]] = queue.Queue()
+        self.command_q: queue.Queue[Dict[str, Any]] = queue.Queue()
+        self.inspection_mode_var = tk.BooleanVar(value=False)
 
         self.setup_styles()
         
@@ -623,16 +662,28 @@ class AdvancedProxyApp(tk.Tk):
         """Creates the action buttons"""
         btn_frame = ttk.Frame(self)
         btn_frame.pack(side="bottom", fill="x", pady=5)
+
+        self.mode_toggle_button = ttk.Checkbutton(
+            btn_frame,
+            text="🔍 Inspection Mode",
+            variable=self.inspection_mode_var,
+            command=self.toggle_operational_mode # This command will be implemented in a later step
+        )
+        self.mode_toggle_button.pack(side="left", padx=10)
         
-        ttk.Button(
+        self.send_modified_button = ttk.Button(
             btn_frame, text="▶️ Send Modified", 
-            command=self.send_modified
-        ).pack(side="left", padx=5)
+            command=self.send_modified,
+            state="disabled" # Start disabled
+        )
+        self.send_modified_button.pack(side="left", padx=5)
         
-        ttk.Button(
+        self.send_original_button = ttk.Button(
             btn_frame, text="➡️ Send Original", 
-            command=self.send_unmodified
-        ).pack(side="left", padx=5)
+            command=self.send_unmodified,
+            state="disabled" # Start disabled
+        )
+        self.send_original_button.pack(side="left", padx=5)
         
         ttk.Button(
             btn_frame, text="📋 Copy as cURL", 
@@ -654,11 +705,18 @@ class AdvancedProxyApp(tk.Tk):
             command=self.toggle_capture
         ).pack(side="right", padx=5)
 
+    def toggle_operational_mode(self):
+        new_mode = "Inspection" if self.inspection_mode_var.get() else "Interception"
+        self.command_q.put({"type": "SET_MODE", "mode": new_mode})
+        # Button state changes will be handled in a later step
+        self.status_var.set(f"Switched to {new_mode} Mode.")
+        self.update_action_button_states() # Add this line
+
     def start_proxy_thread(self):
         """Starts the proxy in a separate thread"""
         self.proxy_thread = threading.Thread(
             target=run_proxy,
-            args=(self.gui_q, self.mod_q, self.port, self.verbose),
+            args=(self.gui_q, self.mod_q, self.command_q, self.port, self.verbose),
             daemon=True,
         )
         self.proxy_thread.start()
@@ -728,6 +786,20 @@ class AdvancedProxyApp(tk.Tk):
         self.populate_websocket_tab(flow_data)
         
         self.status_var.set(f"Selected flow: {iid[:8]} - {flow_data['req_method']} {flow_data['req_url']}")
+        self.update_action_button_states() # Add this line
+
+    def update_action_button_states(self):
+        selected_items = self.tree.selection()
+        in_interception_mode = not self.inspection_mode_var.get()
+
+        if in_interception_mode and selected_items:
+            # Only enable if a flow is selected AND we are in interception mode
+            # (assuming a selected flow in interception mode is one that is held)
+            self.send_modified_button.config(state="normal")
+            self.send_original_button.config(state="normal")
+        else:
+            self.send_modified_button.config(state="disabled")
+            self.send_original_button.config(state="disabled")
 
     def clear_all_views(self):
         """Clears all views"""
@@ -1022,6 +1094,7 @@ Protocol: WebSocket
             del self.flows_data[iid]
         self.clear_all_views()
         self.status_var.set(f"Flow {iid[:8]} {message}.")
+        self.update_action_button_states() # Add this line
 
     def copy_as_curl(self):
         """Copies the flow as a cURL command"""
@@ -1069,6 +1142,7 @@ Protocol: WebSocket
             self.flows_data.clear()
             self.clear_all_views()
             self.status_var.set("Session cleared.")
+            self.update_action_button_states() # Add this line
 
 def main():
     """Main function"""
