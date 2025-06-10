@@ -187,6 +187,7 @@ class AuditorAddon:
     def response(self, flow: http.HTTPFlow) -> None:
         """Processes intercepted HTTP responses"""
         self._process_commands()
+
         if not PATTERN.search(flow.request.pretty_url):
             return
 
@@ -205,6 +206,7 @@ class AuditorAddon:
 
         flow.reply.take()
         while True:
+            self._update_mode()
             try:
                 mod_data = self.mod_q.get(timeout=0.1)
                 if mod_data["id"] == flow.id:
