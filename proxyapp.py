@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import zlib
+import binascii # For Base64Decoder error handling
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote_plus, quote_plus
 import hashlib
@@ -38,62 +39,450 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 import tkinter.font as tkFont
 
-class Codec:
-    """Class for encoding and decoding HTTP content"""
-    ENCODING_TYPES = ["AUTO", "GZIP", "DEFLATE", "BASE64", "URL_ENCODED", "TEXT"]
+class Decoder:
+    """Base class for all decoders."""
+    def decode(self, data: bytes, headers: Dict[str, str], flow: Optional[http.HTTPFlow] = None) -> Tuple[Optional[str], Optional[str], bool]:
+        """
+        Attempts to decode the given data.
+        Returns:
+            A tuple (decoded_text, encoding_name, editable_flag).
+            (None, None, False) if decoding fails or is not applicable.
+            encoding_name is a descriptive string like "GZIP (Header)".
+        """
+        raise NotImplementedError("Subclasses must implement this method")
 
-    @staticmethod
-    def auto_decode(body_bytes: bytes, headers: Dict[str, str] = None) -> Tuple[str, str, bool]:
-        """Automatically decodes content based on headers and heuristics"""
-        if not body_bytes:
-            return "", "TEXT", True
+    def encode(self, text: str) -> Optional[bytes]:
+        """
+        Encodes the given text back into bytes using the decoder's specific format.
+        Returns:
+            Bytes if encoding is successful, None otherwise.
+        """
+        raise NotImplementedError("Subclasses must implement this method")
 
-        content_encoding = (headers or {}).get("content-encoding", "").lower()
+class GzipDecoder(Decoder):
+    """Decodes GZIP content based on Content-Encoding header."""
+    def decode(self, data: bytes, headers: Dict[str, str], flow: Optional[http.HTTPFlow] = None) -> Tuple[Optional[str], Optional[str], bool]:
+        content_encoding = headers.get("content-encoding", "").lower()
         if "gzip" in content_encoding:
             try:
-                decoded = gzip.decompress(body_bytes).decode("utf-8", "ignore")
-                return decoded, "GZIP", True
-            except (IOError, zlib.error):
-                pass
-        elif "deflate" in content_encoding:
-            try:
-                decoded = zlib.decompress(body_bytes).decode("utf-8", "ignore")
-                return decoded, "DEFLATE", True
-            except zlib.error:
-                pass
+                decoded_text = gzip.decompress(data).decode("utf-8", "ignore")
+                return decoded_text, "GZIP (Header)", True
+            except (IOError, zlib.error, UnicodeDecodeError):
+                return None, None, False
+        return None, None, False
 
+    def encode(self, text: str) -> Optional[bytes]:
         try:
-            decoded_b64 = base64.b64decode(body_bytes, validate=True)
-            if all(c in range(32, 127) or c in [9, 10, 13] for c in decoded_b64):
-                return decoded_b64.decode("utf-8", "ignore"), "BASE64", True
-        except (ValueError, TypeError):
-            pass
-
-        try:
-            decoded_url = unquote_plus(body_bytes.decode("utf-8", "ignore"))
-            if decoded_url != body_bytes.decode("utf-8", "ignore"):
-                return decoded_url, "URL_ENCODED", True
+            return gzip.compress(text.encode("utf-8"))
         except Exception:
-            pass
+            return None
+
+class DeflateDecoder(Decoder):
+    """Decodes DEFLATE content based on Content-Encoding header."""
+    def decode(self, data: bytes, headers: Dict[str, str], flow: Optional[http.HTTPFlow] = None) -> Tuple[Optional[str], Optional[str], bool]:
+        content_encoding = headers.get("content-encoding", "").lower()
+        if "deflate" in content_encoding:
+            try:                # Try standard zlib decompress (with header)
+                decoded_text = zlib.decompress(data).decode("utf-8", "ignore")
+                return decoded_text, "DEFLATE (Header)", True
+            except (zlib.error, UnicodeDecodeError):
+                try:
+                    # Try raw deflate (without zlib header)
+                    decoded_text = zlib.decompress(data, -zlib.MAX_WBITS).decode("utf-8", "ignore")
+                    return decoded_text, "DEFLATE (Header)", True # Still header triggered
+                except (zlib.error, UnicodeDecodeError):
+                    return None, None, False
+        return None, None, False
+
+    def encode(self, text: str) -> Optional[bytes]:
+        try:
+            # Standard zlib compression (with header)
+            return zlib.compress(text.encode("utf-8"))
+        except Exception:
+            return None
+
+class Base64Decoder(Decoder):
+    """Decodes Base64 content heuristically."""
+    def decode(self, data: bytes, headers: Dict[str, str], flow: Optional[http.HTTPFlow] = None) -> Tuple[Optional[str], Optional[str], bool]:
+        content_encoding = headers.get("content-encoding", "").lower()
+        if content_encoding and content_encoding not in ["identity", "base64", ""]: # Allow if no encoding or identity
+             return None, None, False
 
         try:
-            return body_bytes.decode("utf-8"), "TEXT", True
+            decoded_b64_bytes = base64.b64decode(data, validate=True)
+
+            is_printable = all(c in range(32, 127) or c in [9, 10, 13] for c in decoded_b64_bytes)
+            if not is_printable:
+                return None, None, False
+
+            # Heuristic: If the original data was valid UTF-8 and identical to the decoded version,
+            # it's unlikely to be Base64. This helps prevent decoding plain text that happens to be valid Base64.
+            try:
+                original_text = data.decode('utf-8')
+                if original_text == decoded_b64_bytes.decode('utf-8', 'ignore'):
+                    # If they are identical, and the original didn't *need* b64 decoding to be text,
+                    # then it's probably not base64, unless it's very short (where coincidences happen).
+                    if len(data) > 4: # Arbitrary short length, many short strings are valid b64
+                        return None, None, False
+            except UnicodeDecodeError:
+                # Original data was not valid UTF-8, so b64 is more plausible.
+                pass
+
+            return decoded_b64_bytes.decode("utf-8", "ignore"), "BASE64 (Heuristic)", True
+
+        except (ValueError, TypeError, binascii.Error):
+            return None, None, False
+        # Fallthrough, should ideally not be reached if logic above is complete
+        return None, None, False
+
+
+    def encode(self, text: str) -> Optional[bytes]:
+        try:
+            return base64.b64encode(text.encode("utf-8"))
+        except Exception:
+            return None
+
+class UrlEncodedDecoder(Decoder):
+    """Decodes URL-encoded content based on header or heuristics."""
+    def decode(self, data: bytes, headers: Dict[str, str], flow: Optional[http.HTTPFlow] = None) -> Tuple[Optional[str], Optional[str], bool]:
+        content_type = headers.get("content-type", "").lower()
+        is_form_urlencoded_header = "application/x-www-form-urlencoded" in content_type
+
+        try:
+            data_str = data.decode("utf-8", "ignore")
+            unquoted_text = unquote_plus(data_str)
+
+            if is_form_urlencoded_header:
+                return unquoted_text, "URL_ENCODED (Header)", True
+
+            if data_str and unquoted_text != data_str:
+                if '%' in data_str or ('=' in unquoted_text and '&' in unquoted_text) or ('=' in unquoted_text and not '&' in unquoted_text and len(unquoted_text.split('=')) == 2) : # check for key=value or key=value&key=value
+                    return unquoted_text, "URL_ENCODED (Heuristic)", True
+
         except UnicodeDecodeError:
-            return "<non-editable binary data>", "BINARY", False
+            return None, None, False
+        except Exception:
+            return None, None, False
+        return None, None, False
+
+    def encode(self, text: str) -> Optional[bytes]:
+        try:
+            return quote_plus(text).encode("utf-8")
+        except Exception:
+            return None
+
+class TextDecoder(Decoder):
+    """Decodes content as plain text (UTF-8 or Latin-1 fallback)."""
+    def decode(self, data: bytes, headers: Dict[str, str], flow: Optional[http.HTTPFlow] = None) -> Tuple[Optional[str], Optional[str], bool]:
+        try:
+            return data.decode("utf-8"), "TEXT (UTF-8)", True
+        except UnicodeDecodeError:
+            try:
+                return data.decode("latin-1"), "TEXT (Latin-1 Fallback)", True
+            except UnicodeDecodeError:
+                return None, None, False
+
+    def encode(self, text: str) -> Optional[bytes]:
+        try:
+            return text.encode("utf-8")
+        except Exception:
+            return None
+
+class MagicNumberDecoder(Decoder):
+    """Decodes content based on magic numbers (e.g., Gzip, Zlib)."""
+    def decode(self, data: bytes, headers: Dict[str, str], flow: Optional[http.HTTPFlow] = None) -> Tuple[Optional[str], Optional[str], bool]:
+        if not data:
+            return None, None, False
+
+        # Check for Gzip magic numbers: 
+        if data.startswith(b'\x1f\x8b'):
+            try:
+                # Prevent double decoding if Content-Encoding already specified gzip
+                # However, this decoder is for when headers are MISSING or WRONG.
+                # So, if a previous header-based GzipDecoder ran, it would have already decoded.
+                # If this decoder is running, it implies headers didn't lead to Gzip.
+                decoded_text = gzip.decompress(data).decode("utf-8", "ignore")
+                return decoded_text, "GZIP (Magic Number)", True
+            except (IOError, zlib.error, UnicodeDecodeError):
+                return None, None, False # Magic number present, but decompression failed
+
+        # Check for Zlib/Deflate magic numbers (e.g., x, x, xÚ)
+        # x is common for default compression level
+        # x is for no/low compression
+        # xÚ is for best compression
+        if data.startswith(b'\x78\x9c') or data.startswith(b'\x78\x01') or data.startswith(b'\x78\xda'):
+            try:
+                # Try standard zlib decompress (with header)
+                decoded_text = zlib.decompress(data).decode("utf-8", "ignore")
+                return decoded_text, "DEFLATE (Magic Number)", True
+            except (zlib.error, UnicodeDecodeError):
+                try:
+                    # Try raw deflate (without zlib header)
+                    # This might be relevant if only the raw stream has the magic number at its start
+                    # but it's less common for magic numbers to refer to raw streams directly without zlib header.
+                    # However, including for completeness as per original DeflateDecoder logic.
+                    decoded_text = zlib.decompress(data, -zlib.MAX_WBITS).decode("utf-8", "ignore")
+                    return decoded_text, "DEFLATE (Raw Magic Number)", True
+                except (zlib.error, UnicodeDecodeError):
+                    return None, None, False # Magic number present, but decompression failed
+
+        return None, None, False
+
+    def encode(self, text: str) -> Optional[bytes]:
+        # This encoder is tricky. If "GZIP (Magic Number)" was detected, it should gzip.
+        # If "DEFLATE (Magic Number)" was detected, it should zlib compress.
+        # The 'auto_decode' in Codec will need to pass the specific type.
+        # For now, this encode method cannot be uniquely determined without knowing WHICH magic number succeeded.
+        # This implies the Codec class, when calling encode, needs to know the exact successful encoding_name.
+        # A better approach: MagicNumberDecoder could delegate to GzipDecoder.encode or DeflateDecoder.encode,
+        # or it could store the type of magic number found.
+        # For now, let's assume this will be handled by Codec calling the appropriate specific encoder later,
+        # or this decoder won't be directly used for encoding if it's just a detector.
+        # Given AC 5.3 (Symmetrical Encoding), this needs to be resolvable.
+        # Solution: The 'encoding_name' like "GZIP (Magic Number)" will be passed to Codec.encode,
+        # which will then map "GZIP (Magic Number)" to use a Gzip-capable encoder.
+        # So, this specific MagicNumberDecoder.encode might not be directly called if it's too generic.
+        # Let's make it return None to signify it doesn't have a single encoding method.
+        # The Codec class will handle re-encoding based on the *name* from decode.
+        # This means GzipDecoder().encode() or DeflateDecoder().encode() will be used by Codec.
+        return None # This decoder detects; actual encoding is type-specific (Gzip/Deflate)
+
+class JsonProbeDecoder(Decoder):
+    """Probes content to see if it looks like JSON structure for formatting purposes."""
+    def decode(self, data: bytes, headers: Dict[str, str], flow: Optional[http.HTTPFlow] = None) -> Tuple[Optional[str], Optional[str], bool]:
+        if not data:
+            return None, None, False
+
+        try:
+            # Try to decode as UTF-8 first, as JSON is text.
+            # This decoder assumes the data is already decompressed if it was compressed.
+            text_content = data.decode("utf-8", "ignore").strip()
+        except Exception: # Was not text to begin with
+            return None, None, False
+
+        if (text_content.startswith('{') and text_content.endswith('}')) or \
+           (text_content.startswith('[') and text_content.endswith(']')):
+            # Further validation: try to parse it.
+            try:
+                json.loads(text_content) # Try parsing to confirm it's valid JSON
+                # This decoder's purpose is to IDENTIFY JSON for formatting.
+                # The text is already 'decoded' (as in, not compressed).
+                # It returns the text itself, and the name "JSON (Probe)".
+                return text_content, "JSON (Probe)", True # Editable as text
+            except json.JSONDecodeError:
+                return None, None, False # Looks like JSON but isn't valid
+
+        return None, None, False
+
+    def encode(self, text: str) -> Optional[bytes]:
+        # JSON is plain text, so encoding is typically UTF-8.
+        # This probe doesn't imply a transformation like Gzip.
+        # If something was "JSON (Probe)", it means it's text. TextDecoder.encode handles this.
+        # Or, if content was GZIP then JSON, Gzip encoding applies first.
+        # This specific encoder should just return the text as UTF-8 bytes,
+        # as no specific encoding (like Gzip) is implied by "JSON (Probe)" itself.
+        try:
+            return text.encode("utf-8")
+        except Exception:
+            return None
+
+class UrlEncodedProbeDecoder(Decoder):
+    """Probes content for URL-encoded structure for identification."""
+    def decode(self, data: bytes, headers: Dict[str, str], flow: Optional[http.HTTPFlow] = None) -> Tuple[Optional[str], Optional[str], bool]:
+        if not data:
+            return None, None, False
+
+        try:
+            # Data is expected to be a string (already decompressed if necessary)
+            text_content = data.decode("utf-8", "ignore")
+        except Exception: # Not text
+            return None, None, False
+
+        # Heuristic: contains '=' and '&', or just '=' if it's a single key-value pair.
+        # And unquote_plus should change it or it should contain '%'
+        # This is similar to UrlEncodedDecoder but acts as a probe if that one wasn't triggered by header.
+        # Avoid if Content-Type is explicitly something else that's not form-urlencoded.
+        content_type = headers.get("content-type", "").lower()
+        if content_type and "application/x-www-form-urlencoded" not in content_type and \
+           content_type not in ["", "text/plain"]: # Be careful not to misinterpret other text types
+            # If Content-Type is e.g. application/json, this probe shouldn't run or succeed.
+            # This logic depends on pipeline order. For now, let's assume this probe runs late.
+            pass
+
+
+        # Try unquoting. If it changes, it's a good sign.
+        unquoted_text = unquote_plus(text_content)
+
+        # Check for common URL encoding patterns.
+        # A simple check for '=' is often indicative for key-value pairs.
+        # Presence of '&' for multiple pairs.
+        # Presence of '%' for percent-encoding.
+        has_equals = "=" in text_content # or in unquoted_text? text_content is more direct
+        has_ampersand = "&" in text_content
+        has_percent = "%" in text_content # Original encoded form had percent escapes
+
+        # If it was changed by unquote_plus OR it has typical characters.
+        if (unquoted_text != text_content and has_percent) or \
+           (has_equals and (has_ampersand or (not has_ampersand and len(text_content.split('=')) >= 2))):
+            # This means it's likely URL-encoded.
+            # The UrlEncodedDecoder already handles unquoting if it's chosen.
+            # This probe is more about *identifying* it if not already fully processed by UrlEncodedDecoder.
+            # It should return the *original* text if it's just a probe, or unquoted if it's also acting as a decoder.
+            # The plan implies it's a probe identifying structure.
+            # Let's assume it returns the unquoted text, making it act like a late-stage heuristic decoder.
+            return unquoted_text, "URL_ENCODED (Probe)", True # Editable as text
+
+        return None, None, False
+
+    def encode(self, text: str) -> Optional[bytes]:
+        # If content was identified as "URL_ENCODED (Probe)" and then edited,
+        # it should be re-URL-encoded.
+        try:
+            return quote_plus(text).encode("utf-8")
+        except Exception:
+            return None
+
+class ContextualDecoder(Decoder):
+    """Decodes content based on contextual rules from the HTTP flow."""
+
+    def __init__(self):
+        super().__init__()        # For PoC, rules are hardcoded. Ideally, load from a config.
+        # Rule: (host_check, decoder_to_try_class, encoding_name_to_return)
+        # decoder_to_try_class should be a class like GzipDecoder, not an instance.
+        self.rules = [
+            # Example Rule for upload1.myfxbook.com
+            {
+                "condition": lambda flow: flow.request.host == "upload1.myfxbook.com",
+                "action_type": "DECODE_AS_GZIP", # Custom action type
+                "encoding_name": "GZIP (Contextual: upload1.myfxbook.com)"
+            },
+            # Rule for MQL5 sites
+            {
+                "condition": lambda flow: "mql5" in flow.request.host.lower(),
+                "action_type": "DECODE_AS_GZIP", # Custom action type
+                "encoding_name": "GZIP (Contextual: MQL5)"
+            },
+            # Add more rules here if needed for testing
+            {
+                "condition": lambda flow: "api7" in flow.request.host.lower(),
+                "action_type": "DECODE_AS_GZIP", # Custom action type
+                "encoding_name": "GZIP (Contextual: api7)"
+            },
+        ]
+        # We need instances of decoders to call their methods if a rule matches
+        self._gzip_decoder = GzipDecoder()
+        self._deflate_decoder = DeflateDecoder()
+        # Add other decoders if rules might point to them
+
+    def decode(self, data: bytes, headers: Dict[str, str], flow: Optional[http.HTTPFlow] = None) -> Tuple[Optional[str], Optional[str], bool]:
+        if not flow or not data: # Contextual decoding requires flow information and data
+            return None, None, False
+
+        for rule in self.rules:
+            try:
+                if rule["condition"](flow):
+                    action = rule["action_type"]
+                    encoding_name = rule["encoding_name"]
+
+                    if action == "DECODE_AS_GZIP":
+                        # Attempt GZIP decompression directly, regardless of headers
+                        # We use the _gzip_decoder instance's logic but only its decompress and decode part.
+                        # We don't call _gzip_decoder.decode() as that checks headers.
+                        try:
+                            decompressed_data = gzip.decompress(data)
+                            decoded_text = decompressed_data.decode("utf-8", "ignore")
+                            return decoded_text, encoding_name, True
+                        except (IOError, zlib.error, UnicodeDecodeError):
+                            # Rule matched, action attempted, but failed.
+                            # Log this failure? For now, just return None.
+                            return None, None, False # Contextual rule failed to decode
+
+                    # Add other actions like "DECODE_AS_DEFLATE" here
+                    # elif action == "DECODE_AS_DEFLATE":
+                    #     try:
+                    #         decompressed_data = zlib.decompress(data) # or zlib.decompress(data, -zlib.MAX_WBITS)
+                    #         decoded_text = decompressed_data.decode("utf-8", "ignore")
+                    #         return decoded_text, encoding_name, True # e.g. "DEFLATE (Contextual: ...)"
+                    #     except (zlib.error, UnicodeDecodeError):
+                    #         return None, None, False
+
+                    # If a rule matches but action isn't known or fails, stop for this decoder.
+                    return None, None, False
+            except Exception:
+                # Error evaluating a rule's condition, skip to next rule or fail.
+                # For safety, let's assume rule evaluation error means this decoder cannot proceed.
+                # Consider logging this.
+                continue # Try next rule
+
+        return None, None, False # No contextual rules matched or succeeded
+
+    def encode(self, text: str) -> Optional[bytes]:
+        # ContextualDecoder itself doesn't have a single encoding type.
+        # Similar to MagicNumberDecoder, the re-encoding will be based on the
+        # specific 'encoding_name' (e.g., "GZIP (Contextual: api7.mql5.net)")
+        # returned by its decode method. The Codec class will delegate to the
+        # appropriate actual encoder (e.g., GzipDecoder().encode()).
+        return None
+
+class Codec:
+    """Class for encoding and decoding HTTP content"""
+    DECODER_PIPELINE = [
+        # Layer 1: Explicit Headers for transformations
+        GzipDecoder(),
+        DeflateDecoder(),
+        UrlEncodedDecoder(), # Handles header application/x-www-form-urlencoded and also byte-to-text decoding
+        # Layer 2: Magic Numbers & Contextual for transformations
+        MagicNumberDecoder(), # For Gzip/Deflate when headers are missing
+        ContextualDecoder(),  # For flow-based rules leading to transformation (e.g. Gzip)
+        # Layer 2: Heuristic transformations from bytes to text
+        Base64Decoder(),      # Decodes base64 bytes to text
+        # Layer 2: Probes that might also transform bytes to text if not already done
+        # These are placed after primary transformers. They will attempt to decode body_bytes if they match.
+        JsonProbeDecoder(),   # If input is bytes and looks like JSON, decodes to text and names "JSON (Probe)"
+        UrlEncodedProbeDecoder(), # If input is bytes and looks like URL Encoded, decodes to text and names "URL_ENCODED (Probe)"
+        # Layer 3: Fallback transformation for bytes to text
+        TextDecoder()         # Fallback if all else fails to make it text
+    ]
 
     @staticmethod
-    def encode(text: str, encoding_type: str) -> bytes:
-        """Encodes text into the specified format"""
-        if encoding_type == "GZIP":
-            return gzip.compress(text.encode("utf-8"))
-        if encoding_type == "DEFLATE":
-            return zlib.compress(text.encode("utf-8"))
-        if encoding_type == "BASE64":
-            return base64.b64encode(text.encode("utf-8"))
-        if encoding_type == "URL_ENCODED":
-            return quote_plus(text).encode("utf-8")
-        if encoding_type == "TEXT":
-            return text.encode("utf-8")
+    def auto_decode(body_bytes: bytes, headers: Dict[str, str] = None, flow: Optional[http.HTTPFlow] = None) -> Tuple[str, str, bool]:
+        if not body_bytes:
+            return "", "TEXT (Empty)", True # More descriptive for empty content
+
+        effective_headers = headers if headers is not None else {}
+
+        for decoder_instance in Codec.DECODER_PIPELINE:
+            decoded_text, encoding_name, editable_flag = decoder_instance.decode(body_bytes, effective_headers, flow)
+
+            if decoded_text is not None:
+                return decoded_text, encoding_name, editable_flag
+
+        return "<non-editable binary data>", "BINARY", False
+
+    @staticmethod
+    def encode(text: str, encoding_name: str) -> bytes:
+        """Encodes text based on the descriptive encoding name from auto_decode."""
+
+        encoder_to_use = None
+
+        if encoding_name is None:
+             pass
+        elif "GZIP" in encoding_name:
+            encoder_to_use = GzipDecoder()
+        elif "DEFLATE" in encoding_name:
+            encoder_to_use = DeflateDecoder()
+        elif "URL_ENCODED" in encoding_name:
+            encoder_to_use = UrlEncodedDecoder()
+        elif "BASE64" in encoding_name:
+            encoder_to_use = Base64Decoder()
+        elif "TEXT" in encoding_name or "JSON (Probe)" in encoding_name or encoding_name == "BINARY" or encoding_name == "TEXT (Empty)":
+            encoder_to_use = TextDecoder()
+
+        if encoder_to_use:
+            encoded_bytes = encoder_to_use.encode(text)
+            if encoded_bytes is not None:
+                return encoded_bytes
+
         return text.encode("utf-8", "ignore")
 
     @staticmethod
@@ -131,10 +520,8 @@ class FlowAnalyzer:
     def analyze_timing(flow_data: Dict[str, Any]) -> Dict[str, str]:
         """Analyzes flow timing information"""
         timing_info = {}
-        
         if "timestamp_start" in flow_data:
             timing_info["Start"] = flow_data["timestamp_start"]
-        
         if "duration" in flow_data:
             timing_info["Duration"] = flow_data["duration"]
             
@@ -155,7 +542,7 @@ class FlowAnalyzer:
                 
         return info
 
-PATTERN = re.compile(r"upload1", flags=re.I)
+PATTERN = re.compile(r"upload1|mql5|api7", flags=re.I)
 
 class AuditorAddon:
     """mitmproxy addon to intercept and process HTTP flows"""
@@ -164,13 +551,29 @@ class AuditorAddon:
         self,
         gui_q: queue.Queue[Dict[str, Any]],
         mod_q: queue.Queue[Dict[str, Any]],
+        command_q: queue.Queue[Dict[str, Any]],
     ) -> None:
         self.gui_q = gui_q
         self.mod_q = mod_q
+        self.command_q = command_q
+        self.operational_mode = "Interception"
         self.first_post_seen = False
 
     def response(self, flow: http.HTTPFlow) -> None:
-        """Processes intercepted HTTP responses"""
+        # Check for commands from the GUI, like mode changes
+        try:
+            while not self.command_q.empty():
+                command = self.command_q.get_nowait()
+                if command.get("type") == "SET_MODE":
+                    new_mode = command.get("mode")
+                    if new_mode in ["Inspection", "Interception"]:
+                        self.operational_mode = new_mode
+                        ctx.log.info(f"[Auditor] Switched to {self.operational_mode} Mode.")
+                    else:
+                        ctx.log.warn(f"[Auditor] Unknown mode received: {new_mode}")
+        except queue.Empty:
+            pass # No commands pending
+
         if not PATTERN.search(flow.request.pretty_url):
             return
 
@@ -179,27 +582,47 @@ class AuditorAddon:
             self.first_post_seen = True
             is_initial_post = True
         
-        ctx.log.info(f"[Auditor] Intercepted: {flow.request.method} {flow.request.pretty_url}")
+        ctx.log.info(f"[Auditor] Intercepted ({self.operational_mode} Mode): {flow.request.method} {flow.request.pretty_url}")
 
         flow_data = self._extract_flow_data(flow, is_initial_post)
         self.gui_q.put(flow_data)
 
-        flow.reply.take()
-        while True:
-            try:
-                mod_data = self.mod_q.get(timeout=0.1)
-                if mod_data["id"] == flow.id:
-                    if mod_data.get("req_body_modified") is not None:
-                        flow.request.content = mod_data["req_body_modified"]
-                    if mod_data.get("resp_body_modified") is not None:
-                        flow.response.content = mod_data["resp_body_modified"]
-                    break
-            except queue.Empty:
-                if not self.gui_q.full():
+        if self.operational_mode == "Interception":
+            flow.reply.take()
+            # Add a small timeout to mod_q.get to allow command_q processing
+            # if we were to check command_q inside this loop too.
+            # For now, command_q is checked at the start of response.
+            while True:
+                try:
+                    # Check for commands again in case of long-held flow?
+                    # This could be complex. For now, mode set at start of response handles new flows.
+                    # Held flows will complete in the mode they were caught in.
+                    mod_data = self.mod_q.get(timeout=0.1) # Keep timeout to allow GUI responsiveness
+                    if mod_data["id"] == flow.id:
+                        if mod_data.get("req_body_modified") is not None:
+                            flow.request.content = mod_data["req_body_modified"]
+                        if mod_data.get("resp_body_modified") is not None:
+                            flow.response.content = mod_data["resp_body_modified"]
+                        break
+                except queue.Empty:
+                    # This is important: if we are in interception mode and waiting,
+                    # we should not continuously try to process command_q here,
+                    # as it would block the primary function of waiting for mod_data.
+                    # The mode is set when the flow first comes into response().
+                    # If a mode change happens while a flow is *already* held,
+                    # it will complete based on the mode it was captured in.
+                    # This matches the requirement: "Flows that were already
+                    # intercepted and are being held in 'Interception Mode' should
+                    # remain held even if the user switches to 'Inspection Mode'."
                     continue
-            except Exception:
-                break
-        flow.reply()
+                except Exception as e:
+                    ctx.log.error(f"[Auditor] Error processing mod_q: {e}")
+                    break # Break on other errors
+            flow.reply()
+        else: # Inspection Mode
+            # Flow automatically continues, no flow.reply.take() or flow.reply() here
+            # as mitmproxy handles it if we don't take the reply.
+            ctx.log.info(f"[Auditor] Inspecting (not holding): {flow.request.pretty_url}")
 
     def _extract_flow_data(self, flow: http.HTTPFlow, is_initial_post: bool) -> Dict[str, Any]:
         """Extracts all possible information from the HTTP flow"""
@@ -251,6 +674,7 @@ class AuditorAddon:
         flow_data.update({
             "req_method": flow.request.method,
             "req_url": flow.request.pretty_url,
+            "req_host": flow.request.host, # Added req_host
             "req_headers": dict(flow.request.headers),
             "req_body_bytes": flow.request.content or b'',
             "req_http_version": flow.request.http_version,
@@ -296,9 +720,34 @@ class AuditorAddon:
                 "resp_stream": False,
                 "duration": "N/A",
                 "timestamp_end": "N/A",
-                "timestamp_end_raw": 0,
-            })
-        
+                "timestamp_end_raw": 0,            })
+
+        # Request decoding (occurs *after* flow_data is initialized)
+        req_decoded_text, req_encoding_name, req_editable_flag = Codec.auto_decode(
+            flow_data["req_body_bytes"], # Use raw bytes from flow_data
+            flow_data["req_headers"],    # Use headers from flow_data
+            flow                       # Pass the live flow object
+        )
+        flow_data["req_decoded_text"] = req_decoded_text
+        flow_data["req_encoding_name"] = req_encoding_name
+        flow_data["req_editable_flag"] = req_editable_flag
+
+        # Response decoding (occurs *after* flow_data is initialized)
+        if flow.response:
+            resp_decoded_text, resp_encoding_name, resp_editable_flag = Codec.auto_decode(
+                flow_data["resp_body_bytes"], # Use raw bytes from flow_data
+                flow_data["resp_headers"],    # Use headers from flow_data
+                flow                          # Pass the live flow object
+            )
+            flow_data["resp_decoded_text"] = resp_decoded_text
+            flow_data["resp_encoding_name"] = resp_encoding_name
+            flow_data["resp_editable_flag"] = resp_editable_flag
+        else:
+            # Ensure these keys are present even if there's no response
+            flow_data["resp_decoded_text"] = ""
+            flow_data["resp_encoding_name"] = "TEXT (Empty)"
+            flow_data["resp_editable_flag"] = True
+            
         if flow.error:
             flow_data["error_msg"] = str(flow.error.msg)
             flow_data["error_timestamp"] = time.strftime("%H:%M:%S", time.localtime(flow.error.timestamp))
@@ -318,6 +767,7 @@ class AuditorAddon:
 def run_proxy(
     gui_q: queue.Queue,
     mod_q: queue.Queue,
+    command_q: queue.Queue,
     port: int,
     verbose: bool,
 ) -> None:
@@ -325,7 +775,7 @@ def run_proxy(
     async def main_coro():
         opts = Options(listen_host="127.0.0.1", listen_port=port, ssl_insecure=True)
         master = DumpMaster(opts, with_termlog=verbose, with_dumper=False)
-        master.addons.add(AuditorAddon(gui_q, mod_q))
+        master.addons.add(AuditorAddon(gui_q, mod_q, command_q))
 
         try:
             await master.run()
@@ -355,6 +805,8 @@ class AdvancedProxyApp(tk.Tk):
 
         self.gui_q: queue.Queue[Dict[str, Any]] = queue.Queue()
         self.mod_q: queue.Queue[Dict[str, Any]] = queue.Queue()
+        self.command_q: queue.Queue[Dict[str, Any]] = queue.Queue()
+        self.inspection_mode_var = tk.BooleanVar(value=False)
 
         self.setup_styles()
         
@@ -623,16 +1075,28 @@ class AdvancedProxyApp(tk.Tk):
         """Creates the action buttons"""
         btn_frame = ttk.Frame(self)
         btn_frame.pack(side="bottom", fill="x", pady=5)
+
+        self.mode_toggle_button = ttk.Checkbutton(
+            btn_frame,
+            text="🔍 Inspection Mode",
+            variable=self.inspection_mode_var,
+            command=self.toggle_operational_mode # This command will be implemented in a later step
+        )
+        self.mode_toggle_button.pack(side="left", padx=10)
         
-        ttk.Button(
+        self.send_modified_button = ttk.Button(
             btn_frame, text="▶️ Send Modified", 
-            command=self.send_modified
-        ).pack(side="left", padx=5)
+            command=self.send_modified,
+            state="disabled" # Start disabled
+        )
+        self.send_modified_button.pack(side="left", padx=5)
         
-        ttk.Button(
+        self.send_original_button = ttk.Button(
             btn_frame, text="➡️ Send Original", 
-            command=self.send_unmodified
-        ).pack(side="left", padx=5)
+            command=self.send_unmodified,
+            state="disabled" # Start disabled
+        )
+        self.send_original_button.pack(side="left", padx=5)
         
         ttk.Button(
             btn_frame, text="📋 Copy as cURL", 
@@ -654,11 +1118,18 @@ class AdvancedProxyApp(tk.Tk):
             command=self.toggle_capture
         ).pack(side="right", padx=5)
 
+    def toggle_operational_mode(self):
+        new_mode = "Inspection" if self.inspection_mode_var.get() else "Interception"
+        self.command_q.put({"type": "SET_MODE", "mode": new_mode})
+        # Button state changes will be handled in a later step
+        self.status_var.set(f"Switched to {new_mode} Mode.")
+        self.update_action_button_states() # Add this line
+
     def start_proxy_thread(self):
         """Starts the proxy in a separate thread"""
         self.proxy_thread = threading.Thread(
             target=run_proxy,
-            args=(self.gui_q, self.mod_q, self.port, self.verbose),
+            args=(self.gui_q, self.mod_q, self.command_q, self.port, self.verbose),
             daemon=True,
         )
         self.proxy_thread.start()
@@ -728,6 +1199,20 @@ class AdvancedProxyApp(tk.Tk):
         self.populate_websocket_tab(flow_data)
         
         self.status_var.set(f"Selected flow: {iid[:8]} - {flow_data['req_method']} {flow_data['req_url']}")
+        self.update_action_button_states() # Add this line
+
+    def update_action_button_states(self):
+        selected_items = self.tree.selection()
+        in_interception_mode = not self.inspection_mode_var.get()
+
+        if in_interception_mode and selected_items:
+            # Only enable if a flow is selected AND we are in interception mode
+            # (assuming a selected flow in interception mode is one that is held)
+            self.send_modified_button.config(state="normal")
+            self.send_original_button.config(state="normal")
+        else:
+            self.send_modified_button.config(state="disabled")
+            self.send_original_button.config(state="disabled")
 
     def clear_all_views(self):
         """Clears all views"""
@@ -799,19 +1284,25 @@ Response MD5 Hash: {FlowAnalyzer.calculate_hash(flow_data['resp_body_bytes'])}
     def populate_request_tab(self, flow_data: Dict[str, Any]):
         """Populates the request tab"""
         headers_text = "\n".join(f"{k}: {v}" for k, v in flow_data["req_headers"].items())
+        self.req_headers_text.config(state="normal")
+        self.req_headers_text.delete("1.0", tk.END)
         self.req_headers_text.insert("1.0", headers_text)
+        self.req_headers_text.config(state="disabled")
         
-        req_decoded, req_type, req_editable = Codec.auto_decode(
-            flow_data["req_body_bytes"], flow_data["req_headers"]
-        )
+        req_decoded_text = flow_data["req_decoded_text"]
+        req_encoding_name = flow_data["req_encoding_name"]
+        req_editable_flag = flow_data["req_editable_flag"]
         
-        content_type = flow_data["req_headers"].get("content-type", "")
-        formatted_content = Codec.format_content(req_decoded, content_type)
+        content_type_header = flow_data["req_headers"].get("content-type", "")
+        formatted_content = Codec.format_content(req_decoded_text, content_type_header)
         
+        self.req_body_text.config(state="normal")
+        self.req_body_text.delete("1.0", tk.END)
         self.req_body_text.insert("1.0", formatted_content)
-        if not req_editable:
+        if not req_editable_flag:
             self.req_body_text.config(state="disabled")
         
+        # Update the req_info_text to show the new descriptive req_type
         http_info = f"""HTTP Version: {flow_data['req_http_version']}
 HTTP/1.0: {'Yes' if flow_data['req_is_http10'] else 'No'}
 HTTP/1.1: {'Yes' if flow_data['req_is_http11'] else 'No'}
@@ -819,26 +1310,32 @@ HTTP/2: {'Yes' if flow_data['req_is_http2'] else 'No'}
 HTTP/3: {'Yes' if flow_data['req_is_http3'] else 'No'}
 Stream: {flow_data['req_stream']}
 Trailers: {len(flow_data['req_trailers'])} items
-Detected Codec: {req_type}
-"""
+Detected Codec: {req_encoding_name}"""
         
+        self.req_info_text.config(state="normal")
+        self.req_info_text.delete("1.0", tk.END)
         self.req_info_text.insert("1.0", http_info)
         self.req_info_text.config(state="disabled")
 
     def populate_response_tab(self, flow_data: Dict[str, Any]):
         """Populates the response tab"""
         headers_text = "\n".join(f"{k}: {v}" for k, v in flow_data["resp_headers"].items())
+        self.resp_headers_text.config(state="normal")
+        self.resp_headers_text.delete("1.0", tk.END)
         self.resp_headers_text.insert("1.0", headers_text)
+        self.resp_headers_text.config(state="disabled")
         
-        resp_decoded, resp_type, resp_editable = Codec.auto_decode(
-            flow_data["resp_body_bytes"], flow_data["resp_headers"]
-        )
+        resp_decoded_text = flow_data["resp_decoded_text"]
+        resp_encoding_name = flow_data["resp_encoding_name"]
+        resp_editable_flag = flow_data["resp_editable_flag"]
         
-        content_type = flow_data["resp_headers"].get("content-type", "")
-        formatted_content = Codec.format_content(resp_decoded, content_type)
+        content_type_header = flow_data["resp_headers"].get("content-type", "")
+        formatted_content = Codec.format_content(resp_decoded_text, content_type_header)
         
+        self.resp_body_text.config(state="normal")
+        self.resp_body_text.delete("1.0", tk.END)
         self.resp_body_text.insert("1.0", formatted_content)
-        if not resp_editable:
+        if not resp_editable_flag:
             self.resp_body_text.config(state="disabled")
         
         http_info = f"""HTTP Version: {flow_data['resp_http_version']}
@@ -848,9 +1345,10 @@ HTTP/2: {'Yes' if flow_data['resp_is_http2'] else 'No'}
 HTTP/3: {'Yes' if flow_data['resp_is_http3'] else 'No'}
 Stream: {flow_data['resp_stream']}
 Trailers: {len(flow_data['resp_trailers'])} items
-Detected Codec: {resp_type}
-"""
+Detected Codec: {resp_encoding_name}"""
         
+        self.resp_info_text.config(state="normal")
+        self.resp_info_text.delete("1.0", tk.END)
         self.resp_info_text.insert("1.0", http_info)
         self.resp_info_text.config(state="disabled")
 
@@ -904,31 +1402,33 @@ Transfer Rate: {(len(flow_data['req_body_bytes']) + len(flow_data['resp_body_byt
 
     def populate_codec_tab(self, flow_data: Dict[str, Any], iid: str):
         """Populates the codec/editing tab"""
-        req_decoded, req_type, req_editable = Codec.auto_decode(
-            flow_data["req_body_bytes"], flow_data["req_headers"]
-        )
-        
+        # Request part
+        req_decoded_text = flow_data["req_decoded_text"]
+        req_encoding_name = flow_data["req_encoding_name"]
+        req_editable_flag = flow_data["req_editable_flag"]
+
         self.req_edit_text.config(state="normal")
-        self.req_edit_text.insert("1.0", req_decoded)
-        if not req_editable:
+        self.req_edit_text.delete("1.0", tk.END)
+        self.req_edit_text.insert("1.0", req_decoded_text)
+        if not req_editable_flag:
             self.req_edit_text.config(state="disabled")
-        
-        self.req_codec_label.config(text=f"Detected Codec: {req_type}")
-        
-        resp_decoded, resp_type, resp_editable = Codec.auto_decode(
-            flow_data["resp_body_bytes"], flow_data["resp_headers"]
-        )
-        
+        self.req_codec_label.config(text=f"Detected Codec: {req_encoding_name}")
+
+        # Response part
+        resp_decoded_text = flow_data["resp_decoded_text"]
+        resp_encoding_name = flow_data["resp_encoding_name"]
+        resp_editable_flag = flow_data["resp_editable_flag"]
+
         self.resp_edit_text.config(state="normal")
-        self.resp_edit_text.insert("1.0", resp_decoded)
-        if not resp_editable:
+        self.resp_edit_text.delete("1.0", tk.END)
+        self.resp_edit_text.insert("1.0", resp_decoded_text)
+        if not resp_editable_flag:
             self.resp_edit_text.config(state="disabled")
-        
-        self.resp_codec_label.config(text=f"Detected Codec: {resp_type}")
+        self.resp_codec_label.config(text=f"Detected Codec: {resp_encoding_name}")
         
         self.codec_info[iid] = {
-            'req_type': req_type,
-            'resp_type': resp_type
+            'req_type': req_encoding_name,
+            'resp_type': resp_encoding_name
         }
 
     def populate_errors_tab(self, flow_data: Dict[str, Any]):
@@ -1022,6 +1522,7 @@ Protocol: WebSocket
             del self.flows_data[iid]
         self.clear_all_views()
         self.status_var.set(f"Flow {iid[:8]} {message}.")
+        self.update_action_button_states() # Add this line
 
     def copy_as_curl(self):
         """Copies the flow as a cURL command"""
@@ -1040,9 +1541,22 @@ Protocol: WebSocket
                 curl_cmd += f" -H '{k}: {v}'"
             
             if flow_data['req_body_bytes']:
-                req_decoded, _, _ = Codec.auto_decode(flow_data['req_body_bytes'], flow_data['req_headers'])
-                curl_cmd += f" -d '{req_decoded}'"
-            
+                mock_request_obj = type('MockRequest', (object,), {
+                    'host': flow_data.get('req_host', None),
+                    'headers': flow_data.get('req_headers', {})
+                })
+                mock_flow_obj = type('MockFlow', (object,), {'request': mock_request_obj, 'response': None})
+                req_decoded, _, _ = Codec.auto_decode(
+                    flow_data['req_body_bytes'],
+                    flow_data['req_headers'],
+                    mock_flow_obj
+                )                # Ensure req_decoded is properly escaped for shell command if it contains quotes
+                # For simplicity, assuming it's used directly as in original code.
+                # A more robust way is to use shlex.quote or similar if text can be arbitrary.
+                # However, original code directly embedded it.
+                escaped_data = req_decoded.replace("'", "'\\''")  # Basic single quote escaping
+                curl_cmd += f" -d '{escaped_data}'"
+
             self.clipboard_clear()
             self.clipboard_append(curl_cmd)
             self.update()
@@ -1069,6 +1583,7 @@ Protocol: WebSocket
             self.flows_data.clear()
             self.clear_all_views()
             self.status_var.set("Session cleared.")
+            self.update_action_button_states() # Add this line
 
 def main():
     """Main function"""
