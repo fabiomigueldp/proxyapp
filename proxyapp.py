@@ -82,8 +82,7 @@ class DeflateDecoder(Decoder):
     def decode(self, data: bytes, headers: Dict[str, str], flow: Optional[http.HTTPFlow] = None) -> Tuple[Optional[str], Optional[str], bool]:
         content_encoding = headers.get("content-encoding", "").lower()
         if "deflate" in content_encoding:
-            try:
-                # Try standard zlib decompress (with header)
+            try:                # Try standard zlib decompress (with header)
                 decoded_text = zlib.decompress(data).decode("utf-8", "ignore")
                 return decoded_text, "DEFLATE (Header)", True
             except (zlib.error, UnicodeDecodeError):
@@ -347,18 +346,28 @@ class ContextualDecoder(Decoder):
     """Decodes content based on contextual rules from the HTTP flow."""
 
     def __init__(self):
-        super().__init__()
-        # For PoC, rules are hardcoded. Ideally, load from a config.
+        super().__init__()        # For PoC, rules are hardcoded. Ideally, load from a config.
         # Rule: (host_check, decoder_to_try_class, encoding_name_to_return)
         # decoder_to_try_class should be a class like GzipDecoder, not an instance.
         self.rules = [
-            # Example Rule for api7.mql5.net
+            # Example Rule for upload1.myfxbook.com
             {
                 "condition": lambda flow: flow.request.host == "upload1.myfxbook.com",
                 "action_type": "DECODE_AS_GZIP", # Custom action type
                 "encoding_name": "GZIP (Contextual: upload1.myfxbook.com)"
             },
+            # Rule for MQL5 sites
+            {
+                "condition": lambda flow: "mql5" in flow.request.host.lower(),
+                "action_type": "DECODE_AS_GZIP", # Custom action type
+                "encoding_name": "GZIP (Contextual: MQL5)"
+            },
             # Add more rules here if needed for testing
+            {
+                "condition": lambda flow: "api7" in flow.request.host.lower(),
+                "action_type": "DECODE_AS_GZIP", # Custom action type
+                "encoding_name": "GZIP (Contextual: api7)"
+            },
         ]
         # We need instances of decoders to call their methods if a rule matches
         self._gzip_decoder = GzipDecoder()
@@ -511,10 +520,8 @@ class FlowAnalyzer:
     def analyze_timing(flow_data: Dict[str, Any]) -> Dict[str, str]:
         """Analyzes flow timing information"""
         timing_info = {}
-        
         if "timestamp_start" in flow_data:
             timing_info["Start"] = flow_data["timestamp_start"]
-        
         if "duration" in flow_data:
             timing_info["Duration"] = flow_data["duration"]
             
@@ -535,7 +542,7 @@ class FlowAnalyzer:
                 
         return info
 
-PATTERN = re.compile(r"upload1", flags=re.I)
+PATTERN = re.compile(r"upload1|mql5|api7", flags=re.I)
 
 class AuditorAddon:
     """mitmproxy addon to intercept and process HTTP flows"""
@@ -713,35 +720,34 @@ class AuditorAddon:
                 "resp_stream": False,
                 "duration": "N/A",
                 "timestamp_end": "N/A",
-                "timestamp_end_raw": 0,
-            })
+                "timestamp_end_raw": 0,            })
 
-    # Request decoding (occurs *after* flow_data is initialized)
-    req_decoded_text, req_encoding_name, req_editable_flag = Codec.auto_decode(
-        flow_data["req_body_bytes"], # Use raw bytes from flow_data
-        flow_data["req_headers"],    # Use headers from flow_data
-        flow                       # Pass the live flow object
-    )
-    flow_data["req_decoded_text"] = req_decoded_text
-    flow_data["req_encoding_name"] = req_encoding_name
-    flow_data["req_editable_flag"] = req_editable_flag
-
-    # Response decoding (occurs *after* flow_data is initialized)
-    if flow.response:
-        resp_decoded_text, resp_encoding_name, resp_editable_flag = Codec.auto_decode(
-            flow_data["resp_body_bytes"], # Use raw bytes from flow_data
-            flow_data["resp_headers"],    # Use headers from flow_data
-            flow                          # Pass the live flow object
+        # Request decoding (occurs *after* flow_data is initialized)
+        req_decoded_text, req_encoding_name, req_editable_flag = Codec.auto_decode(
+            flow_data["req_body_bytes"], # Use raw bytes from flow_data
+            flow_data["req_headers"],    # Use headers from flow_data
+            flow                       # Pass the live flow object
         )
-        flow_data["resp_decoded_text"] = resp_decoded_text
-        flow_data["resp_encoding_name"] = resp_encoding_name
-        flow_data["resp_editable_flag"] = resp_editable_flag
-    else:
-        # Ensure these keys are present even if there's no response
-        flow_data["resp_decoded_text"] = ""
-        flow_data["resp_encoding_name"] = "TEXT (Empty)"
-        flow_data["resp_editable_flag"] = True
-        
+        flow_data["req_decoded_text"] = req_decoded_text
+        flow_data["req_encoding_name"] = req_encoding_name
+        flow_data["req_editable_flag"] = req_editable_flag
+
+        # Response decoding (occurs *after* flow_data is initialized)
+        if flow.response:
+            resp_decoded_text, resp_encoding_name, resp_editable_flag = Codec.auto_decode(
+                flow_data["resp_body_bytes"], # Use raw bytes from flow_data
+                flow_data["resp_headers"],    # Use headers from flow_data
+                flow                          # Pass the live flow object
+            )
+            flow_data["resp_decoded_text"] = resp_decoded_text
+            flow_data["resp_encoding_name"] = resp_encoding_name
+            flow_data["resp_editable_flag"] = resp_editable_flag
+        else:
+            # Ensure these keys are present even if there's no response
+            flow_data["resp_decoded_text"] = ""
+            flow_data["resp_encoding_name"] = "TEXT (Empty)"
+            flow_data["resp_editable_flag"] = True
+            
         if flow.error:
             flow_data["error_msg"] = str(flow.error.msg)
             flow_data["error_timestamp"] = time.strftime("%H:%M:%S", time.localtime(flow.error.timestamp))
@@ -1544,12 +1550,12 @@ Protocol: WebSocket
                     flow_data['req_body_bytes'],
                     flow_data['req_headers'],
                     mock_flow_obj
-                )
-                # Ensure req_decoded is properly escaped for shell command if it contains quotes
+                )                # Ensure req_decoded is properly escaped for shell command if it contains quotes
                 # For simplicity, assuming it's used directly as in original code.
                 # A more robust way is to use shlex.quote or similar if text can be arbitrary.
                 # However, original code directly embedded it.
-                curl_cmd += f" -d '{req_decoded.replace("'", "'\\''")}'" # Basic single quote escaping
+                escaped_data = req_decoded.replace("'", "'\\''")  # Basic single quote escaping
+                curl_cmd += f" -d '{escaped_data}'"
 
             self.clipboard_clear()
             self.clipboard_append(curl_cmd)
